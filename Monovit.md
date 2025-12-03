@@ -1,6 +1,4 @@
-这份 Markdown 文档为你总结了使用 Monodepth2 (配合 MPViT Encoder) 进行训练和自定义评测的全流程。你可以直接将以下内容保存为 `README.md` 或发布到你的技术博客中。
 
----
 
 # Monodepth2 (MPViT版) 训练与评测实战指南
 
