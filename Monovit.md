@@ -1,20 +1,24 @@
 
 
-# Monodepth2 (MPViT版) 训练与评测实战指南
+# Monodepth2 (MPViT) 训练与自定义评测实战总结
 
-本文档总结了基于 Monodepth2 框架（替换 Encoder 为 MPViT-Small）进行单目深度估计模型训练及编写自定义评测脚本的实战经验。
+本文档记录了基于 Monodepth2 框架（替换 Encoder 为 MPViT-Small）进行训练，并编写自定义脚本在私有数据集上进行评估的全流程。
 
-## 1. 训练流程 (Training)
+## 1. 训练环境与指令 (Training)
 
-在开始训练前，针对显存碎片化问题和多卡训练环境，需要进行特定的环境配置。
+在训练阶段，针对显存碎片化问题和多卡训练环境，使用了以下配置。
+
+### 关键配置说明
+*   **显存优化**: 设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 是为了解决高版本 PyTorch 在显存看似充足时仍报 OOM (Out Of Memory) 的问题。
+*   **多卡训练**: 使用 `CUDA_VISIBLE_DEVICES=4,5` 指定两张显卡，这会导致模型权重保存时包含 `module.` 前缀，评测时需特别处理。
 
 ### 启动命令
 
 ```bash
-# 解决 PyTorch 显存碎片化导致的 OOM 问题
+# 1. 设置环境变量解决显存碎片化
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# 指定使用 GPU 4, 5 进行训练
+# 2. 启动训练
 CUDA_VISIBLE_DEVICES=4,5 python train.py \
   --log_dir /home/yxy/lgw/monodepth2-master/ \
   --model_name mono1 \
@@ -28,19 +32,13 @@ CUDA_VISIBLE_DEVICES=4,5 python train.py \
   --num_epochs 20
 ```
 
-### 关键参数说明
-*   **显存优化**: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 是在高版本 PyTorch 中解决显存不足（尽管显存看起来还够）的关键环境变量。
-*   **多卡训练**: 使用 `CUDA_VISIBLE_DEVICES` 指定多张卡，代码内部通常会使用 `DataParallel`，这会导致保存权重的 Key 带有 `module.` 前缀（评测时需注意）。
-*   **分辨率**: `--height 480 --width 640`，请确保显存足够，且评测时必须保持一致。
-*   **数据**: 使用 `--dataset custom` 和自定义的数据分割 `--split custom`。
-
 ---
 
-## 2. 评测脚本详解 (Evaluation)
+## 2. 完整评测代码 (Evaluation)
 
-由于 Monodepth2 原版评测脚本通常针对 KITTI 数据集，针对自定义数据集（如 PNG 格式的 Depth GT），我们需要重写评测逻辑。
+由于使用了自定义数据集（GT 为 16-bit PNG，单位 mm），且训练时使用了 DataParallel，原版评测脚本无法直接使用。
 
-### 2.1 依赖与配置
+以下是调试通过的完整评测脚本 `evaluate_custom.py`。该脚本包含了模型加载（自动去除 `module.` 前缀）、单位转换（mm 转 m）、以及单目深度估计必须的 **Median Scaling** 对齐。
 
 ```python
 from __future__ import absolute_import, division, print_function
@@ -48,38 +46,37 @@ import os
 import cv2
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 from torchvision import transforms
 import PIL.Image as pil
 
-# 引入项目依赖 (确保 networks, layers, utils 在 python path 下)
+# === 引入项目依赖 ===
+# 请确保 monodepth2 的源码目录在 PYTHONPATH 中
 import networks
 from layers import disp_to_depth
+from utils import readlines
 
-# === 配置区域 ===
-# 权重路径 (指向包含 encoder.pth 和 depth.pth 的文件夹)
+# ================= 配置区域 =================
+# 权重文件夹路径 (指向具体的 weights_xx 文件夹)
 model_path = "/home/yxy/lgw/monodepth2-master/mono2/models/weights_29/"
 
 # 数据路径
 rgb_dir = "/home/yxy/lgw/monodepth2-master/eval_data/rgb/"
 gt_dir = "/home/yxy/lgw/monodepth2-master/eval_data/depth_gt/"
 
-# 模型输入分辨率 (必须与训练时完全一致！)
+# 模型输入分辨率 (必须与训练时一致！否则特征不对齐)
 input_height = 480
 input_width = 640
 
-# 深度限制 (米) - 用于过滤无效值和天空
+# 深度限制 (米) - 用于过滤极近点和天空/无穷远
 MIN_DEPTH = 1e-3
 MAX_DEPTH = 200
-```
+# ===========================================
 
-### 2.2 定义评价指标
-
-严格遵循标准深度估计评价公式（AbsRel, SqRel, RMSE, $\delta < 1.25^n$）。
-
-```python
 def compute_errors(gt, pred):
     """
     计算预测值与真实值之间的误差指标
+    严格遵循标准深度估计评价公式
     """
     thresh = np.maximum((gt / pred), (pred / gt))
     a1 = (thresh < 1.25     ).mean()
@@ -93,37 +90,38 @@ def compute_errors(gt, pred):
     rmse_log = np.sqrt(rmse_log.mean())
 
     abs_rel = np.mean(np.abs(gt - pred) / gt)
+
     sq_rel = np.mean(((gt - pred) ** 2) / gt)
 
     return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
-```
 
-### 2.3 模型加载与权重处理 (核心坑点)
-
-训练时使用了多卡 (`DataParallel`)，导致保存的权重字典 Key 中包含 `module.` 前缀。单卡推理时必须去除该前缀，否则会报错 `Missing key(s)`。
-
-```python
 def evaluate():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"-> Using device: {device}")
-    print(f"-> Loading model from {model_path}")
+    print("-> Using device: {}".format(device))
 
-    # 1. 实例化模型结构
-    # Encoder: MPViT Small (通道数需对应)
+    # ---------------------------------------------------------
+    # 1. 加载模型结构
+    # ---------------------------------------------------------
+    print("-> Loading model from {}".format(model_path))
+
+    # 实例化 Encoder (mpvit_small)
+    # 注意：这里必须与你训练时的定义一致
     encoder = networks.mpvit_small()
     encoder.num_ch_enc = [64, 128, 216, 288, 288] 
-    
-    # Decoder
+
+    # 实例化 Decoder
     depth_decoder = networks.DepthDecoder(encoder.num_ch_enc)
 
-    # 2. 加载权重文件
+    # ---------------------------------------------------------
+    # 2. 加载权重 (处理 DataParallel 的 module. 前缀)
+    # ---------------------------------------------------------
     encoder_dict = torch.load(os.path.join(model_path, "encoder.pth"), map_location=device)
     decoder_dict = torch.load(os.path.join(model_path, "depth.pth"), map_location=device)
 
-    # 3. 清洗权重 Key (去除 'module.' 前缀)
     encoder_model_dict = encoder.state_dict()
     decoder_model_dict = depth_decoder.state_dict()
 
+    # 核心步骤：过滤掉 'module.' 前缀，否则单卡加载会报错
     encoder_dict = {k.replace('module.', ''): v for k, v in encoder_dict.items() 
                     if k.replace('module.', '') in encoder_model_dict}
     decoder_dict = {k.replace('module.', ''): v for k, v in decoder_dict.items() 
@@ -136,107 +134,117 @@ def evaluate():
     encoder.eval()
     depth_decoder.to(device)
     depth_decoder.eval()
-    
-    # ... (接下文推理循环)
-```
 
-### 2.4 推理循环与数据对齐
-
-单目深度估计存在**尺度不确定性 (Scale Ambiguity)**，因此在评测时通常使用 **Median Scaling**（中位数对齐）将预测值对齐到真实值的尺度。
-
-**主要步骤：**
-1.  **预处理**: RGB 图片 Resize 到 `(480, 640)` 并转 Tensor。
-2.  **推理**: 获得视差图 (Disp)，转换为深度图，并 Resize 回原始 GT 的分辨率。
-3.  **单位转换**: 这里的 GT 是 16-bit PNG (单位 mm)，需要除以 1000 转换为米。
-4.  **Mask**: 过滤掉 GT 为 0 或超出 `[MIN_DEPTH, MAX_DEPTH]` 的无效像素。
-5.  **Scaling**: `pred_depth *= np.median(gt) / np.median(pred)`。
-
-```python
-    # ... (接上文模型加载)
-    
+    # ---------------------------------------------------------
+    # 3. 准备评估数据
+    # ---------------------------------------------------------
     rgb_files = sorted([f for f in os.listdir(rgb_dir) if f.endswith('.jpg')])
-    print(f"-> Found {len(rgb_files)} images")
+    print("-> Found {} images in {}".format(len(rgb_files), rgb_dir))
 
     errors = []
     ratios = []
+
+    # 图像预处理 (ToTensor)
     to_tensor = transforms.ToTensor()
 
     print("-> Computing predictions and evaluating...")
 
     with torch.no_grad():
         for i, file_name in enumerate(rgb_files):
-            # === 1. 读取与预处理 ===
+            # === 读取 RGB ===
             rgb_path = os.path.join(rgb_dir, file_name)
             input_image = pil.open(rgb_path).convert('RGB')
-            # 必须使用 LANCZOS 或 BILINEAR 缩放
+            original_width, original_height = input_image.size
+            
+            # Resize 到模型输入大小 (LANCZOS 抗锯齿效果较好)
             input_image_resized = input_image.resize((input_width, input_height), pil.LANCZOS)
             input_tensor = to_tensor(input_image_resized).unsqueeze(0).to(device)
 
-            # === 2. 模型推理 ===
+            # === 模型推理 ===
             features = encoder(input_tensor)
             outputs = depth_decoder(features)
             
-            # 取出 scale 0 的视差
+            # 获取最高分辨率的视差图 (disp scale 0)
             pred_disp = outputs[("disp", 0)]
+            # 转换视差 -> 深度 (虽然这里只是归一化操作，实际深度需Scaling)
             pred_disp, _ = disp_to_depth(pred_disp, MIN_DEPTH, MAX_DEPTH)
-            pred_disp = pred_disp.cpu().numpy()[0, 0]
+            pred_disp = pred_disp.cpu().numpy()[0, 0] # shape: (H_net, W_net)
 
-            # === 3. 读取 GT 并对齐分辨率 ===
+            # === 读取 GT ===
+            # 假设 GT 文件名与 RGB 同名，后缀为 png
             base_name = os.path.splitext(file_name)[0]
-            gt_path = os.path.join(gt_dir, base_name + ".png")
+            gt_file_name = base_name + ".png"
+            gt_path = os.path.join(gt_dir, gt_file_name)
 
             if not os.path.exists(gt_path):
+                print(f"Warning: GT file not found for {file_name}, skipping.")
                 continue
 
-            # 读取 16-bit PNG (单位通常为 mm)
-            gt_depth = cv2.imread(gt_path, -1)
-            if gt_depth is None: continue
-
-            gt_height, gt_width = gt_depth.shape[:2]
+            # 读取 16-bit PNG (原始数据通常单位是 mm)
+            gt_depth = cv2.imread(gt_path, -1) 
             
-            # 将 GT 从毫米转换为米
+            if gt_depth is None:
+                print(f"Warning: Could not load GT {gt_path}, skipping.")
+                continue
+            
+            gt_height, gt_width = gt_depth.shape[:2]
+
+            # === 转换单位 ===
+            # GT (mm) -> GT (meters)
+            # Monodepth2 评价指标基于米，若不转换，RMSE 会异常巨大
             gt_depth = gt_depth.astype(np.float32) / 1000.0
 
-            # 将预测视差 Resize 到 GT 的原始分辨率
+            # === 后处理与对齐 ===
+            # 将预测的视差图 resize 回原始 GT 的分辨率进行对比
             pred_disp = cv2.resize(pred_disp, (gt_width, gt_height))
             pred_depth = 1 / pred_disp
 
-            # === 4. 生成有效掩码 (Mask) ===
+            # 生成 Mask
+            # 1. GT 必须有值 (>0)
             mask = gt_depth > 0
+            # 2. 限制在有效深度范围内 [MIN, MAX]
             mask = np.logical_and(mask, gt_depth > MIN_DEPTH)
             mask = np.logical_and(mask, gt_depth < MAX_DEPTH)
 
+            # 过滤无效点
             pred_depth = pred_depth[mask]
             gt_depth = gt_depth[mask]
 
-            if len(gt_depth) == 0: continue
+            if len(gt_depth) == 0:
+                print(f"Warning: No valid depth points for {file_name}, skipping.")
+                continue
 
-            # === 5. 中位数缩放 (Median Scaling) ===
-            # 单目模型没有绝对尺度，必须对齐
+            # === Median Scaling (中位数缩放) ===
+            # 单目自监督模型没有绝对尺度，必须用 GT 进行对齐
             ratio = np.median(gt_depth) / np.median(pred_depth)
             ratios.append(ratio)
             pred_depth *= ratio
 
-            # 截断预测值范围
+            # 限制最终预测值的范围
             pred_depth[pred_depth < MIN_DEPTH] = MIN_DEPTH
             pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
 
-            # === 6. 计算单张图片指标 ===
+            # === 计算指标 ===
             error = compute_errors(gt_depth, pred_depth)
             errors.append(error)
 
             if (i + 1) % 50 == 0:
-                print(f"   Processed {i+1}/{len(rgb_files)}")
+                print(f"   Processed {i+1}/{len(rgb_files)} images")
 
-    # === 结果汇总 ===
+    # === 汇总输出 ===
     if len(errors) > 0:
         mean_errors = np.array(errors).mean(0)
+        
+        # 打印 Scaling 统计
         ratios = np.array(ratios)
         med = np.median(ratios)
         print("\nScaling ratios | med: {:0.3f} | std: {:0.3f}".format(med, np.std(ratios / med)))
+
         print("\nResults:")
         print(("{:>10} | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
         print(("&{: 10.3f} " * 7).format(*mean_errors.tolist()) + "\\\\")
+        
+        print("\nNote: RMSE and Sq Rel are computed in METERS (assuming input GT was mm).")
     else:
         print("No valid data processed.")
 
@@ -244,9 +252,15 @@ if __name__ == "__main__":
     evaluate()
 ```
 
-## 3. 经验总结 (Key Takeaways)
+## 3. 经验总结 (避坑指南)
 
-1.  **输入尺寸一致性**: 评测时 `input_image.resize` 的目标尺寸 `(input_width, input_height)` 必须严格等于训练时的参数，否则 Encoder 输出的特征图尺寸与 Decoder 不匹配会报错，或者推理结果极差。
-2.  **单位换算**: 很多深度数据集（如 TUM, KITTI-Raw png, Custom）的 16-bit PNG 默认单位是**毫米**。Monodepth2 的内部计算和 RMSE 指标通常基于**米**。务必执行 `/ 1000.0` 操作。
-3.  **DataParallel 权重加载**: 直接 `torch.load` 多卡训练的权重会带有 `module.` 前缀，导致模型加载失败。使用字典推导式 `{k.replace('module.', ''): v ...}` 是最通用的解决方案。
-4.  **Median Scaling**: 自监督单目深度估计无法恢复绝对尺度。如果你没有使用双目或 LiDAR 进行尺度监督，必须在评测代码中引入 `ratio = median(gt) / median(pred)` 进行对齐，否则 RMSE 和 AbsRel 会非常大且无意义。
+在调试过程中，主要解决了以下三个核心问题：
+
+1.  **权重键值不匹配 (`module.`)**:
+    *   **现象**: 训练用了 `CUDA_VISIBLE_DEVICES=4,5`，PyTorch 会自动包裹 `DataParallel`，导致保存的 `state_dict` 中所有 key 都有 `module.` 前缀。单卡推理时直接 load 会报错 `Missing key(s)`。
+    *   **解决**: 在代码中使用字典推导式 `{k.replace('module.', ''): v ...}` 清洗 key。
+
+2.  **评价指标异常大**:
+    *   **现象**: `rmse` 达到几百甚至上千。
+    *   **原因**: 自定义数据集的深度 GT 是 16-bit PNG，通常单位是 **毫米 (mm)**，而 Monodepth2 的计算逻辑默认是 **米 (m)**。
+    *   **解决**: 读取
